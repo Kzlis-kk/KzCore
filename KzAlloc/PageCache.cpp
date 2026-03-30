@@ -396,7 +396,6 @@ void PageCacheShard::ReleaseSpanToCold(Span* span) noexcept {
     VirtualFree(ptr, span->_n << PAGE_SHIFT, MEM_DECOMMIT);
 #else
     madvise(ptr, span->_n << PAGE_SHIFT, MADV_DONTNEED);
-    // printf("[DEBUG] Releasing Cold Span: ptr=%p, pages=%zu. Using madvise.\n", ptr, span->_n);
 #endif
 
     // 3. 挂入 Cold 容器
@@ -420,7 +419,7 @@ Span* PageCacheShard::AllocFromHotList(SpanList& list, size_t k) noexcept {
     if (span->_n > k) {
         Span* split = _spanPool.New();
         if (!split) [[unlikely]] { 
-            list.PushFront(span); 
+            list.PushFront(span);
             _totalFreePages += span->_n;
             return nullptr; 
         }

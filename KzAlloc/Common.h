@@ -67,7 +67,8 @@ inline size_t GetSystemPhysicalMemory() noexcept {
 }
 
 // 2MB 阈值，超过这个值尝试申请大页 (Linux 默认大页通常是 2MB)
-static constexpr size_t HUGE_PAGE_THRESHOLD = 2 * 1024 * 1024;
+inline constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+inline constexpr size_t HUGE_PAGE_MASK = ~(HUGE_PAGE_SIZE - 1);
 // 向系统申请 kpage 页的内存
 // 可优化点：可以实现一个 SystemHeap,
 // 每次向 OS 批发一大块（比如 1GB，使用 mmap，不需要切头去尾，因为 1GB 必然是 8KB 对齐的）,
@@ -79,54 +80,57 @@ static constexpr size_t HUGE_PAGE_THRESHOLD = 2 * 1024 * 1024;
     // Windows 的 VirtualAlloc 默认分配粒度是 64KB
     return VirtualAlloc(0, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-    // Linux mmap
-    void* ptr = MAP_FAILED;
-
-    // 尝试大页 (2MB)
-    if (size >= HUGE_PAGE_THRESHOLD) [[unlikely]] {
-        ptr = mmap(0, size, PROT_READ | PROT_WRITE, 
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
+    // Hot Path: 纯大页分配 (2MB 的整数倍)
+    if ((size & ~HUGE_PAGE_MASK) == 0) [[likely]] {
+        void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
+        
+        // OS 保证大页 2MB 对齐
         if (ptr != MAP_FAILED) [[likely]] {
             return ptr;
         }
+        // 如果大页失败 (系统未开启或碎片过多)，则 Fallback 到下面的通用逻辑
     }
-    
 
-    if constexpr (PAGE_SIZE <= 4096) {
-        // 4KB 页逻辑 (直接申请)
-        ptr = mmap(0, size, PROT_READ | PROT_WRITE, 
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (ptr != MAP_FAILED) [[likely]] {
-            return ptr;
+    // Cold Path: 大页 + 小页混合分配 或 纯小页分配
+    // 虚拟地址占位
+    size_t reserve_size = size + HUGE_PAGE_SIZE;
+    void* reserve_ptr = mmap(nullptr, reserve_size, PROT_NONE, 
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserve_ptr == MAP_FAILED) [[unlikely]] return nullptr;
+
+    // 计算 2MB 对齐的起始地址
+    uintptr_t raw_addr = reinterpret_cast<uintptr_t>(reserve_ptr);
+    uintptr_t aligned_addr = (raw_addr + HUGE_PAGE_SIZE - 1) & HUGE_PAGE_MASK;
+
+    // 切除头尾多余的虚拟地址
+    size_t prefix_len = aligned_addr - raw_addr;
+    if (prefix_len > 0) munmap(reserve_ptr, prefix_len);
+    
+    size_t suffix_len = reserve_size - size - prefix_len;
+    if (suffix_len > 0) munmap(reinterpret_cast<void*>(aligned_addr + size), suffix_len);
+
+    void* final_ptr = reinterpret_cast<void*>(aligned_addr);
+
+    // 大页 + 小页混合物理映射 (MAP_FIXED 覆盖)
+    size_t huge_part = size & HUGE_PAGE_MASK;
+    size_t small_part = size - huge_part;
+
+    if (huge_part > 0) [[likely]] {
+        void* huge_ptr = mmap(final_ptr, huge_part, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE | MAP_FIXED, -1, 0);
+        if (huge_ptr == MAP_FAILED) [[unlikely]] {
+            // Fallback: 如果大页失败，用普通页覆盖
+            mmap(final_ptr, huge_part, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         }
     }
-    else {
-        // Fallback 逻辑 (4KB页 -> 手动对齐)
-        // 多申请一页用于调整
-        size_t allocSize = size + PAGE_SIZE;
+    assert(small_part > 0);
+    void* small_ptr_start = reinterpret_cast<void*>(aligned_addr + huge_part);
+    mmap(small_ptr_start, small_part, PROT_READ | PROT_WRITE,
+         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     
-        void* raw_ptr = mmap(0, allocSize, PROT_READ | PROT_WRITE, 
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                   
-        if (raw_ptr == MAP_FAILED) [[unlikely]] return nullptr;
-    
-        // 向上对齐，必须转为 uintptr_t 才能做位运算，不能用 char* 直接 &
-        uintptr_t aligned_addr = (reinterpret_cast<uintptr_t>(raw_ptr) + PAGE_ROUND_UP_NUM) & PAGE_ROUND_UP_NUM_NEGATE;
-    
-        // 切除头部
-        size_t prefix_len = aligned_addr - reinterpret_cast<uintptr_t>(raw_ptr);
-        if (prefix_len > 0) {
-            munmap(raw_ptr, prefix_len);
-        }
-    
-        // 切除尾部
-        size_t suffix_len = allocSize - size - prefix_len;
-        if (suffix_len > 0) {
-            munmap(reinterpret_cast<void*>(aligned_addr + size), suffix_len);
-        }
-    
-        return reinterpret_cast<void*>(aligned_addr);
-    }
+    return final_ptr;
 #endif
 }
 

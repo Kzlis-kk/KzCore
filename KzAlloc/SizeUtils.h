@@ -16,10 +16,10 @@
 
 namespace KzAlloc {
 // 页大小配置: 8KB
-static constexpr size_t PAGE_SHIFT = 13;
-static constexpr size_t PAGE_SIZE = 1 << PAGE_SHIFT;
-static constexpr size_t PAGE_ROUND_UP_NUM = PAGE_SIZE - 1;
-static constexpr size_t PAGE_ROUND_UP_NUM_NEGATE = ~PAGE_ROUND_UP_NUM;
+inline constexpr size_t PAGE_SHIFT = 14;
+inline constexpr size_t PAGE_SIZE = 1 << PAGE_SHIFT;
+inline constexpr size_t PAGE_ROUND_UP_NUM = PAGE_SIZE - 1;
+inline constexpr size_t PAGE_ROUND_UP_NUM_NEGATE = ~PAGE_ROUND_UP_NUM;
 
 // 桶的总数量 (16+56+56+112+24 = 264)
 // [1, 128B]: 8B 对齐 (8, 16, ... 128)
@@ -27,8 +27,8 @@ static constexpr size_t PAGE_ROUND_UP_NUM_NEGATE = ~PAGE_ROUND_UP_NUM;
 // [1KB, 8KB]: 128B 对齐
 // [8KB, 64KB]: 512B 对齐
 // [64KB, 256KB]: 8KB 对齐
-static constexpr int MAX_NFREELISTS = 264;
-static constexpr size_t MAX_BYTES = 256 * 1024;
+inline constexpr int MAX_NFREELISTS = 264;
+inline constexpr size_t MAX_BYTES = 256 * 1024;
 // =========================================================================
 // SizeUtils
 // 管理内存对齐和桶映射的静态工具集
