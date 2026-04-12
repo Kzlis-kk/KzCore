@@ -1,40 +1,6 @@
 #include "ThreadCache.h"
 
 namespace KzAlloc {
-
-void* ThreadCache::Allocate(size_t size) noexcept {
-    // 计算桶索引
-    int index = SizeUtils::Index(size);
-    FreeList& list = _freeLists[index];
-
-    // 优先从 FreeList 拿
-    if (!list.Empty()) [[likely]] {
-        return list.Pop();
-    }
-
-    // 没货了，找 CentralCache 进货 (Cold Path)
-    return FetchFromCentralCache(index, size);
-}
-
-void ThreadCache::Deallocate(void* ptr, size_t size) noexcept {
-    assert(ptr);
-
-    // 计算桶索引
-    int index = SizeUtils::Index(size);
-
-    FreeList& list = _freeLists[index];
-
-    // 归还给 FreeList
-    list.Push(ptr);
-
-    // 检测是否囤积了太多内存
-    // 如果当前链表长度 > 慢启动阈值，说明该线程可能只是短时间突发分配，
-    // 现在不需要这么多了，归还一部分给 CentralCache，避免内存泄露式占用。
-    if (list.Size() >= list.MaxSize() + list.MaxNum()) {
-        ListTooLong(list, size);
-    }
-}
-
 void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) noexcept {
     FreeList& list = _freeLists[index];
 
@@ -60,7 +26,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) noexcept {
     // 如果批发了多个，剩下的挂到 FreeList 里备用
     if (fetchNum > 1) {
         // start 指向第一个，它要返回给用户，所以 NextObj(start) 才是剩下的链表头
-        void* remainStart = NextObj(start);
+        void* remainStart = GetNextObj(start);
         
         // 这里的 end 就是 FetchRangeObj 返回的尾节点，可以直接用
         // PushRange 是 O(1) 的

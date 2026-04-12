@@ -161,4 +161,27 @@ private:
     std::atomic<int> _init_state[256]{};
 };
 
+inline size_t PageHeap::GetShardIndex() noexcept {
+    static std::atomic<size_t> thread_counter{0};
+    // thread_local 保证每个线程只获取一次
+    static thread_local size_t index = thread_counter.fetch_add(1, std::memory_order_relaxed) & _shardMask;
+    return index;
+}
+
+inline Span* PageHeap::NewSpan(size_t k) noexcept {
+    size_t idx = GetShardIndex();
+    PageCacheShard* shard = GetShard(idx); // 获取或初始化
+    
+    // 路由到指定分片
+    Span* span = shard->NewSpan(k);
+    
+    // 标记出生地
+    // 必须在这里标记，因为 Shard 内部不知道自己的 Index
+    if (span) [[likely]] {
+        span->_shardId = static_cast<uint8_t>(idx);
+    }
+    
+    return span;
+}
+
 } // namespace KzAlloc

@@ -12,7 +12,7 @@ public:
     void Push(void* obj) noexcept {
         assert(obj);
         // 头插法
-        NextObj(obj) = _head;
+        SetNextObj(obj, _head);
         _head = obj;
         
         // 如果是第一个节点，tail 也是它
@@ -25,7 +25,7 @@ public:
     void* Pop() noexcept {
         assert(_head);
         void* obj = _head;
-        _head = NextObj(_head);
+        _head = GetNextObj(_head);
         
         if (_head == nullptr) {
             _tail = nullptr;
@@ -41,7 +41,7 @@ public:
         assert(start && end);
         
         // 把新链表的尾巴接到旧链表的头
-        NextObj(end) = _head;
+        SetNextObj(end, _head);
         _head = start;
 
         // 如果旧链表为空，更新 tail
@@ -57,24 +57,20 @@ public:
     // start, end: 输出参数
     void PopRange(void*& start, void*& end, size_t n) noexcept {
         assert(n <= _size);
-        
-        // 这里的实现需要稍微遍历一下找到第 n 个节点的前驱，或者只移除头部的 n 个
-        // 由于是单链表，如果要截取前 n 个，我们需要找到第 n 个节点作为 end
-        // 但为了性能，ThreadCache 回收时通常不需要极度精确，
-        // 或者我们可以在这里做一个循环 (n 通常不大，且是在回收路径，可接受)
-        
+
+        // 在这里循环 (n 通常不大，且是在回收路径，可接受)
         start = _head;
         // 走 n-1 步找到 end
         end = _head;
         for (size_t i = 0; i < n - 1; ++i) {
-            end = NextObj(end);
+            end = GetNextObj(end);
         }
         
         // 记录新的 head
-        _head = NextObj(end);
+       _head = GetNextObj(end);
         
         // 断开 end 的连接
-        NextObj(end) = nullptr;
+        SetNextObj(end, nullptr);
         
         // 如果取空了，更新 tail
         if (_head == nullptr) {
@@ -141,5 +137,38 @@ private:
     // 哈希桶，对应 SizeUtils 的映射规则
     std::array<FreeList, MAX_NFREELISTS> _freeLists;
 };
+
+inline void* ThreadCache::Allocate(size_t size) noexcept {
+    // 计算桶索引
+    int index = SizeUtils::Index(size);
+    FreeList& list = _freeLists[index];
+
+    // 优先从 FreeList 拿
+    if (!list.Empty()) [[likely]] {
+        return list.Pop();
+    }
+
+    // 没货了，找 CentralCache 进货 (Cold Path)
+    return FetchFromCentralCache(index, size);
+}
+
+inline void ThreadCache::Deallocate(void* ptr, size_t size) noexcept {
+    assert(ptr);
+
+    // 计算桶索引
+    int index = SizeUtils::Index(size);
+
+    FreeList& list = _freeLists[index];
+
+    // 归还给 FreeList
+    list.Push(ptr);
+
+    // 检测是否囤积了太多内存
+    // 如果当前链表长度 > 慢启动阈值，说明该线程可能只是短时间突发分配，
+    // 现在不需要这么多了，归还一部分给 CentralCache，避免内存泄露式占用。
+    if (list.Size() >= list.MaxSize() + list.MaxNum()) {
+        ListTooLong(list, size);
+    }
+}
 
 } // namespace KzAlloc

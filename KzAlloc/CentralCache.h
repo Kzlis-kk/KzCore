@@ -54,4 +54,23 @@ private:
     std::array<SpanListBucket<KzSTL::SpinMutex>, MAX_NFREELISTS> _spanLists;
 };
 
+namespace detail {
+// 慢启动算法 (根据对齐后的大小计算应该一次性申请多少个 aligned_size 大小内存)
+inline size_t CalculateFetchBatchSize(size_t aligned_size) noexcept {
+    size_t num = MAX_BYTES / aligned_size; 
+    if (num == 0) num = 1;
+    if (num > 512) num = 512;
+    return num;
+}
+
+// 计算申请页数
+// 此函数现在假设传入的已经是 aligned_size
+inline size_t CalculatePageNeed(size_t aligned_size) noexcept {
+    size_t num = CalculateFetchBatchSize(aligned_size);
+    size_t npage = (num * aligned_size + PAGE_ROUND_UP_NUM) >> PAGE_SHIFT;
+    if (npage == 0) npage = 1;
+    return npage;
+}
+} // namespace detail
+
 } // namespace KzAlloc

@@ -14,7 +14,7 @@ inline size_t CalculateFetchBatchSize(size_t aligned_size) noexcept {
 // 此函数现在假设传入的已经是 aligned_size
 inline size_t CalculatePageNeed(size_t aligned_size) noexcept {
     size_t num = CalculateFetchBatchSize(aligned_size);
-    size_t npage = (num * aligned_size) >> PAGE_SHIFT;
+    size_t npage = (num * aligned_size + PAGE_ROUND_UP_NUM) >> PAGE_SHIFT;
     if (npage == 0) npage = 1;
     return npage;
 }
@@ -41,15 +41,15 @@ size_t CentralCache::FetchRangeObj(void*& start, void*& end, size_t n, size_t si
     end = start;
     size_t actualNum = 1;
     
-    while (actualNum < n && NextObj(end) != nullptr) {
-        void* next = NextObj(end);
-        __builtin_prefetch(NextObj(next), 0, 3);
+    while (actualNum < n && GetNextObj(end) != nullptr) {
+        void* next = GetNextObj(end);
+        __builtin_prefetch(GetNextObj(next), 0, 3);
         end = next;
         actualNum++;
     }
 
-    span->_freeList = NextObj(end);
-    NextObj(end) = nullptr;
+    span->_freeList = GetNextObj(end);
+    SetNextObj(end, nullptr);
     span->_useCount += actualNum;
 
     bucket._mutex.unlock();
@@ -75,7 +75,7 @@ Span* CentralCache::GetOneSpan(SpanListBucket<KzSTL::SpinMutex>& bucket, size_t 
     // 在此处进行对齐
     // 这是整个分配路径中唯一一次调用 RoundUp
     size_t aligned_size = SizeUtils::RoundUp(size); 
-    size_t kPages = CalculatePageNeed(aligned_size);
+    size_t kPages = detail::CalculatePageNeed(aligned_size);
     
     Span* span = PageHeap::GetInstance()->NewSpan(kPages);
     if (!span) [[unlikely]] return nullptr;
@@ -98,11 +98,11 @@ Span* CentralCache::GetOneSpan(SpanListBucket<KzSTL::SpinMutex>& bucket, size_t 
     // 虽然我们知道总量是 bytes / aligned_size (乘除法关系)
     // 但我们需要把每一个节点的头部写上 data，这个 O(N) 的内存写入无法省略
     while (cur <= end) {
-        NextObj(tail) = cur; 
+        SetNextObj(tail, cur); 
         tail = cur;          
         cur += aligned_size;
     }
-    NextObj(tail) = nullptr;
+    SetNextObj(tail, nullptr);
 
     // 重新加锁
     bucket._mutex.lock();
@@ -130,13 +130,16 @@ void CentralCache::ReleaseListToSpans(void* start, size_t size) noexcept {
     auto flush_batches = [&]() {
         if (batch_cnt == 0) return;
         
-        // 进锁，一次性处理所有批次
+        // 用于收集需要归还给 PageHeap 的 Span
+        Span* spans_to_release[MAX_BATCH];
+        int release_cnt = 0;
+        // 锁内操作，绝对不中途解锁
         bucket._mutex.lock();
         for (int i = 0; i < batch_cnt; ++i) {
             Span* span = batches[i].span;
             
             // 将这一批链表挂回 Span
-            NextObj(batches[i].tail) = span->_freeList;
+            SetNextObj(batches[i].tail, span->_freeList);
             span->_freeList = batches[i].head;
             span->_useCount -= batches[i].count;
 
@@ -146,13 +149,15 @@ void CentralCache::ReleaseListToSpans(void* start, size_t size) noexcept {
                 span->_next = nullptr;
                 span->_prev = nullptr;
                 
-                // 注意：这里必须先解锁，再去调用 PageHeap，防止死锁
-                bucket._mutex.unlock();
-                PageHeap::GetInstance()->ReleaseSpan(span);
-                bucket._mutex.lock(); // 重新加锁处理下一个 batch
+                // 收集起来，稍后处理
+                spans_to_release[release_cnt++] = span;
             }
         }
         bucket._mutex.unlock();
+
+        for (int i = 0; i < release_cnt; ++i) {
+            PageHeap::GetInstance()->ReleaseSpan(spans_to_release[i]);
+        }
         batch_cnt = 0; // 重置
     };
 
@@ -163,7 +168,9 @@ void CentralCache::ReleaseListToSpans(void* start, size_t size) noexcept {
 
     // 遍历链表，在锁外进行 Radix Tree 查询和分组
     while (start) {
-        void* next = NextObj(start);
+        void* next = GetNextObj(start);
+        // 立刻斩断当前节点与原链表的联系，防止脏指针残留
+        SetNextObj(start, nullptr); 
         PAGE_ID id = reinterpret_cast<PAGE_ID>(start) >> PAGE_SHIFT;
 
         Span* span;
@@ -182,7 +189,7 @@ void CentralCache::ReleaseListToSpans(void* start, size_t size) noexcept {
         for (int i = 0; i < batch_cnt; ++i) {
             if (batches[i].span == span) {
                 // 头插法加入当前批次
-                NextObj(start) = batches[i].head;
+                SetNextObj(start, batches[i].head);
                 batches[i].head = start;
                 batches[i].count++;
                 found = true;

@@ -15,6 +15,8 @@
 #include "ConcurrentAlloc.h"
 #include "KzAllocator.h"
 
+#include "KzThread/ThreadUtils.h"
+
 using namespace KzAlloc;
 
 // ============================================================================
@@ -198,7 +200,7 @@ void Benchmark(size_t n_times, size_t alloc_size) {
                 ptrs[i] = KzAlloc::malloc(alloc_size);
             }
             for (size_t i = 0; i < batch_size; ++i) {
-                KzAlloc::free(ptrs[i]);
+                KzAlloc::free(ptrs[i], alloc_size);
             }
         }
         auto end = std::chrono::high_resolution_clock::now();
@@ -207,7 +209,6 @@ void Benchmark(size_t n_times, size_t alloc_size) {
         std::cout << "KzAlloc:      " << cost << " ms  |  " 
                   << (n_times * 2 / 1000.0 / cost) * 1000 << " Kops/sec" << std::endl;
     }
-
 /*
     // 2. 测试 malloc/free
     {
@@ -235,59 +236,96 @@ void MultiThreadBenchmark(size_t n_threads, size_t n_times_per_thread, size_t al
     std::cout << " Multi-Thread Benchmark: " << n_threads << " threads, Size: " << alloc_size << " bytes" << std::endl;
     std::cout << "--------------------------------------------------" << std::endl;
 
+    const unsigned int num_cores = std::thread::hardware_concurrency();
     size_t batch_size = 100000;
 
 
     // KzAlloc
     {
-        auto start = std::chrono::high_resolution_clock::now();
         std::vector<std::thread> vthread;
+        std::atomic<bool> start_flag{false};
+        std::atomic<size_t> finished_threads{0};
+
         for (size_t k = 0; k < n_threads; ++k) {
-            vthread.emplace_back([&]() {
-                // 【修正】初始化 vector 大小，后续只修改值，不扩容
-                std::vector<void*> ptrs(batch_size); 
-                
-                for (size_t k = 0; k < n_times_per_thread; k += batch_size) {
-                    // 【修正】使用下标赋值，而不是 push_back
-                    for (size_t i = 0; i < batch_size; ++i) {
-                        ptrs[i] = KzAlloc::malloc(alloc_size); 
+            vthread.emplace_back([&, thread_id = k]() {
+                KzThread::ThreadUtils::pin_to_core(thread_id % num_cores);
+                KzThread::ThreadUtils::enable_local_memory_policy();
+
+                std::vector<void*> ptrs(batch_size);
+
+                // Spin-wait until the main thread signals to start
+                while (!start_flag.load(std::memory_order_acquire));
+
+                for (size_t i = 0; i < n_times_per_thread; i += batch_size) {
+                    for (size_t j = 0; j < batch_size; ++j) {
+                        ptrs[j] = KzAlloc::malloc(alloc_size);
                     }
-                    // 【修正】释放对应的下标
-                    for (size_t i = 0; i < batch_size; ++i) {
-                        KzAlloc::free(ptrs[i]); 
+                    for (size_t j = 0; j < batch_size; ++j) {
+                        // MODIFIED: Use free with size
+                        KzAlloc::free(ptrs[j], alloc_size);
                     }
                 }
+                finished_threads.fetch_add(1, std::memory_order_release);
             });
         }
-        for (auto& t : vthread) t.join();
+        auto start = std::chrono::high_resolution_clock::now();
+        start_flag.store(true, std::memory_order_release);
+
+        // Wait for all threads to finish their work
+        while (finished_threads.load(std::memory_order_acquire) < n_threads) {
+            std::this_thread::yield();
+        }
         auto end = std::chrono::high_resolution_clock::now();
+
+        for (auto& t : vthread) t.join();
         
         auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        if (cost == 0) cost = 1;
         std::cout << "KzAlloc:       " << cost << " ms  |  " 
                   << (n_times_per_thread * n_threads * 2 / 1000.0 / cost) * 1000 << " Kops/sec" << std::endl;
     }
 /*
     // Malloc (同样的修正)
     {
-        auto start = std::chrono::high_resolution_clock::now();
         std::vector<std::thread> vthread;
+        std::atomic<bool> start_flag{false};
+        std::atomic<size_t> finished_threads{0};
+
         for (size_t k = 0; k < n_threads; ++k) {
-            vthread.emplace_back([&]() {
+            vthread.emplace_back([&, thread_id = k]() {
+                KzThread::ThreadUtils::pin_to_core(thread_id % num_cores);
+                KzThread::ThreadUtils::enable_local_memory_policy();
+
                 std::vector<void*> ptrs(batch_size);
-                for (size_t k = 0; k < n_times_per_thread; k += batch_size) {
-                    for (size_t i = 0; i < batch_size; ++i) {
-                        ptrs[i] = ::malloc(alloc_size);
+
+                // Spin-wait until the main thread signals to start
+                while (!start_flag.load(std::memory_order_acquire));
+
+                for (size_t i = 0; i < n_times_per_thread; i += batch_size) {
+                    for (size_t j = 0; j < batch_size; ++j) {
+                        ptrs[j] = ::malloc(alloc_size);
                     }
-                    for (size_t i = 0; i < batch_size; ++i) {
-                        ::free(ptrs[i]);
+                    for (size_t j = 0; j < batch_size; ++j) {
+                        // MODIFIED: Use free with size
+                        ::free(ptrs[j]);
                     }
                 }
+                finished_threads.fetch_add(1, std::memory_order_release);
             });
         }
-        for (auto& t : vthread) t.join();
+        auto start = std::chrono::high_resolution_clock::now();
+        start_flag.store(true, std::memory_order_release);
+
+        // Wait for all threads to finish their work
+        while (finished_threads.load(std::memory_order_acquire) < n_threads) {
+            std::this_thread::yield();
+        }
         auto end = std::chrono::high_resolution_clock::now();
+
+        for (auto& t : vthread) t.join();
         
         auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        if (cost == 0) cost = 1;
         std::cout << "System Malloc: " << cost << " ms  |  " 
                   << (n_times_per_thread * n_threads * 2 / 1000.0 / cost) * 1000 << " Kops/sec" << std::endl;
     }
@@ -336,18 +374,22 @@ public:
                   << " | Iterations: " << cfg.iterations_per_thread 
                   << " | Working Set: " << cfg.max_working_set << std::endl;
 
+        const unsigned int num_cores = std::thread::hardware_concurrency();
 
         // ----------------------------------------------------------------
         // 1. 测试 KzAlloc
         // ----------------------------------------------------------------
         {
-            auto start = std::chrono::high_resolution_clock::now();
-            
             std::vector<std::thread> threads;
+            std::atomic<bool> start_flag{false};
+            std::atomic<size_t> finished_threads{0};
+
             for (size_t i = 0; i < cfg.thread_count; ++i) {
-                threads.emplace_back([&cfg, i]() {
+                threads.emplace_back([&, thread_id = i]() {
+                    KzThread::ThreadUtils::pin_to_core(thread_id % num_cores);
+                    KzThread::ThreadUtils::enable_local_memory_policy();
                     // 每个线程独立的随机数生成器，保证无锁竞争生成随机数
-                    std::mt19937 gen(1234 + i); 
+                    std::mt19937 gen(1234 + thread_id); 
                     
                     // 模拟工作集：保存分配的指针，稍后释放
                     std::vector<void*> ptrs;
@@ -381,38 +423,55 @@ public:
                             KzAlloc::free(p);
                         }
                     }
-                    
                     // 清理剩余内存
                     for (void* p : ptrs) KzAlloc::free(p);
+                    finished_threads.fetch_add(1, std::memory_order_release);
                 });
             }
 
-            for (auto& t : threads) t.join();
-            
+            auto start = std::chrono::high_resolution_clock::now();
+            start_flag.store(true, std::memory_order_release);
+
+            while (finished_threads.load(std::memory_order_acquire) < cfg.thread_count) {
+                std::this_thread::yield();
+            }
             auto end = std::chrono::high_resolution_clock::now();
+
+            for (auto& t : threads) t.join();
+
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            if (ms == 0) ms = 1;
             
             size_t total_ops = cfg.thread_count * cfg.iterations_per_thread;
             std::cout << "KzAlloc:       " << ms << " ms | " 
                       << (total_ops * 1000.0 / ms / 1000.0) << " Kops/sec" << std::endl;
         }
-
 /*
         // ----------------------------------------------------------------
         // 2. 测试 System Malloc
         // ----------------------------------------------------------------
         {
-            auto start = std::chrono::high_resolution_clock::now();
-            
-            std::vector<std::thread> threads;
+             std::vector<std::thread> threads;
+            std::atomic<bool> start_flag{false};
+            std::atomic<size_t> finished_threads{0};
+
             for (size_t i = 0; i < cfg.thread_count; ++i) {
-                threads.emplace_back([&cfg, i]() {
-                    std::mt19937 gen(1234 + i); // 相同的种子，保证同样的分配序列
+                threads.emplace_back([&, thread_id = i]() {
+                    KzThread::ThreadUtils::pin_to_core(thread_id % num_cores);
+                    KzThread::ThreadUtils::enable_local_memory_policy();
+                    // 每个线程独立的随机数生成器，保证无锁竞争生成随机数
+                    std::mt19937 gen(1234 + thread_id); 
                     
+                    // 模拟工作集：保存分配的指针，稍后释放
                     std::vector<void*> ptrs;
                     ptrs.reserve(cfg.max_working_set);
                     
                     for (size_t k = 0; k < cfg.iterations_per_thread; ++k) {
+                        // 随机决定是 Alloc 还是 Free
+                        // 如果工作集满了，强制 Free；如果空了，强制 Alloc
+                        // 否则 70% 概率 Alloc，30% 概率 Free (模拟内存增长)
+                        // 或者 50/50 模拟稳定状态。这里用 50/50 保持平衡
+                        
                         bool do_alloc = true;
                         if (ptrs.empty()) do_alloc = true;
                         else if (ptrs.size() >= cfg.max_working_set) do_alloc = false;
@@ -423,9 +482,11 @@ public:
                             void* p = ::malloc(sz);
                             ptrs.push_back(p);
                         } else {
+                            // 随机挑一个释放 (模拟无序释放)
                             std::uniform_int_distribution<> dis_idx(0, ptrs.size() - 1);
                             size_t idx = dis_idx(gen);
                             
+                            // Swap remove (O(1) 删除)
                             void* p = ptrs[idx];
                             ptrs[idx] = ptrs.back();
                             ptrs.pop_back();
@@ -433,14 +494,24 @@ public:
                             ::free(p);
                         }
                     }
+                    // 清理剩余内存
                     for (void* p : ptrs) ::free(p);
+                    finished_threads.fetch_add(1, std::memory_order_release);
                 });
             }
 
-            for (auto& t : threads) t.join();
-            
+            auto start = std::chrono::high_resolution_clock::now();
+            start_flag.store(true, std::memory_order_release);
+
+            while (finished_threads.load(std::memory_order_acquire) < cfg.thread_count) {
+                std::this_thread::yield();
+            }
             auto end = std::chrono::high_resolution_clock::now();
+
+            for (auto& t : threads) t.join();
+
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            if (ms == 0) ms = 1;
             
             size_t total_ops = cfg.thread_count * cfg.iterations_per_thread;
             std::cout << "System Malloc: " << ms << " ms | " 
@@ -457,15 +528,15 @@ int main() {
     std::cout << "========================================" << std::endl;
 
     // 1. 基础正确性测试
-    //TestAlignment();
-    //TestLargeAlloc();
+    TestAlignment();
+    TestLargeAlloc();
 
     // 2. STL 适配测试
-    //TestSTLAdapter();
+    TestSTLAdapter();
 
     // 3. 并发健壮性测试
-    //TestCrossThreadFree();
-    //TestMultiThreadContention();
+    TestCrossThreadFree();
+    TestMultiThreadContention();
 
     // 4. 性能对比测试
     std::cout << "\n========================================================" << std::endl;

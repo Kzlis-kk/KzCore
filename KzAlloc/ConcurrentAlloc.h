@@ -7,6 +7,10 @@
 
 namespace KzAlloc {
 
+inline constexpr size_t kMinAlignment = 8;
+
+
+
 namespace detail {
     // 将 ThreadCache 的池子定义在 detail 命名空间中
     // 确保全局唯一的单例
@@ -61,6 +65,7 @@ inline ThreadCache* GetThreadCache() noexcept {
 inline void* malloc(size_t size) noexcept {
     // 处理超大内存 (> 256KB)
     // PageCache 的对齐单位是页 (8KB)
+    void* ptr = nullptr;
     if (size > MAX_BYTES) [[unlikely]] {
         // 向上对齐到页大小
         size_t alignSize = SizeUtils::RoundUp(size);
@@ -73,15 +78,18 @@ inline void* malloc(size_t size) noexcept {
         span->_isUse = true;
 
         // 计算返回地址
-        void* ptr = reinterpret_cast<void*>(span->_pageId << PAGE_SHIFT);
-        return ptr;
+        ptr = reinterpret_cast<void*>(span->_pageId << PAGE_SHIFT);
     }
-
-     if (tls_cache == nullptr) [[unlikely]] {
-        tls_cache = static_cast<ThreadCache*>(CreateThreadCache());
-        static_cast<void>(tls_manager_guard); // 触碰一下 guard，确保编译器为其注册析构函数
+    else {
+        if (tls_cache == nullptr) [[unlikely]] {
+            tls_cache = static_cast<ThreadCache*>(CreateThreadCache());
+            static_cast<void>(tls_manager_guard); // 触碰一下 guard，确保编译器为其注册析构函数
+        }
+        ptr = GetThreadCache()->Allocate(size);
     }
-    return GetThreadCache()->Allocate(size);
+    
+    
+    return ptr;
 }
 
 // ==========================================================
@@ -89,6 +97,8 @@ inline void* malloc(size_t size) noexcept {
 // ==========================================================
 inline void free(void* ptr) noexcept {
     if (ptr == nullptr) return;
+
+   
 
     // 通过地址反查 Span
     // 我们的 PageMap 记录了每个页对应的 Span 指针
@@ -109,13 +119,21 @@ inline void free(void* ptr) noexcept {
 }
 
 inline void free(void* ptr, size_t size) noexcept {
+    
+
     if (size > MAX_BYTES) [[unlikely]]{
             PAGE_ID id = reinterpret_cast<PAGE_ID>(ptr) >> PAGE_SHIFT;
             Span* span = PageMap::GetInstance()->get(id);
             PageHeap::GetInstance()->ReleaseSpan(span);
             return;
         }
-    // 小对象直接走 TLS，跳过 PageMap 查找
+    // 处理线程退出/进程退出时的内存释放
+    if (tls_cache == nullptr) [[unlikely]] {
+        // 当前线程的 ThreadCache 已销毁，直接越级还给 CentralCache
+        SetNextObj(ptr, nullptr); // 必须切断指针，伪装成单节点链表
+        CentralCache::GetInstance()->ReleaseListToSpans(ptr, size);
+        return;
+    }
     GetThreadCache()->Deallocate(ptr, size);
 }
 
@@ -134,11 +152,10 @@ inline size_t GetAllocatedSize(void* ptr) noexcept {
     return span->_objSize;
 }
 
-// ==========================================================
-// 优化版 Realloc (Sized Realloc)
+
+// 优化版 Realloc
 // 场景：STL 容器扩容，或者用户知道原始大小
 // 优势：完全跳过 PageMap 查找，O(1) 完成
-// ==========================================================
 inline void* realloc(void* ptr, size_t old_size, size_t new_size) noexcept {
     // 处理特殊情况
     if (ptr == nullptr) [[unlikely]] {
@@ -155,14 +172,13 @@ inline void* realloc(void* ptr, size_t old_size, size_t new_size) noexcept {
     size_t new_aligned = SizeUtils::RoundUp(new_size);
 
     // 原地复用策略
-    // 情况 A: 规格相同 (例如从 17 扩容到 25，都属于 32 字节桶) -> 直接返回
+    // 规格相同 (例如从 17 扩容到 25，都属于 32 字节桶) -> 直接返回
     if (new_aligned == old_aligned) {
         return ptr;
     }
     
-    // 情况 B: 缩容 (Shrink) -> 懒惰策略
-    // 如果新大小比旧大小小，为了避免频繁抖动，我们通常选择不搬迁
-    // (除非差异巨大，但在通用内存池中，保留原块通常是更优解)
+    // 缩容 -> 懒惰策略
+    // 如果新大小比旧大小小，为了避免频繁抖动，选择不搬迁
     if (new_aligned < old_aligned) [[unlikely]] {
         return ptr;
     }
@@ -170,23 +186,19 @@ inline void* realloc(void* ptr, size_t old_size, size_t new_size) noexcept {
     // 异地扩容
     void* new_ptr = KzAlloc::malloc(new_size);
     if (new_ptr != nullptr) {
-        // 核心优化：只拷贝用户声称的有效数据长度
-        // 这里 old_size 可能小于 old_aligned (例如用户实际只用了 13 字节)
-        // 拷贝 13 字节即可，虽然拷贝 16 字节也安全，但精确拷贝指令更少
+        // 只拷贝用户声称的有效数据长度
         std::memcpy(new_ptr, ptr, old_size);
         
-        // 释放旧内存 (调用 Sized Free，不查 PageMap)
+        // 释放旧内存
         KzAlloc::free(ptr, old_size);
     }
 
     return new_ptr;
 }
 
-// ==========================================================
 // 标准版 Realloc
 // 场景：兼容标准 C 接口，或者不知道旧大小时使用
 // 代价：需要查 PageMap，多一次内存访问
-// ==========================================================
 inline void* realloc(void* ptr, size_t new_size) noexcept {
     if (ptr == nullptr) [[unlikely]] return KzAlloc::malloc(new_size);
     if (new_size == 0) [[unlikely]] {
@@ -206,13 +218,11 @@ inline size_t GetAlignedRequestSize(size_t size, size_t alignment) noexcept {
     return size + alignment + sizeof(void*);
 }
 
-// ==========================================================
-// 对齐内存分配接口 (Aligned Allocation)
+
+// 对齐内存分配接口
 // 场景：SIMD 优化、Cache Line 对齐、硬件设备缓冲区
-// ==========================================================
 inline void* malloc_aligned(size_t size, size_t alignment) noexcept {
-    // 校验对齐参数
-    // 对齐必须是 2 的幂 (e.g., 8, 16, 64, 4096)
+    // 对齐必须是 2 的幂
     assert(alignment != 0 && !(alignment & (alignment - 1)));
     // 对齐不能小于指针大小 (为了存放 Header)
     if (alignment < sizeof(void*)) {
@@ -220,9 +230,7 @@ inline void* malloc_aligned(size_t size, size_t alignment) noexcept {
     }
 
     // 计算总申请大小
-    // 我们需要额外的空间来调整地址，以及存放原始指针(Header)
-    // Worst case padding: alignment - 1
-    // Header size: sizeof(void*)
+    // 需要额外的空间来调整地址，以及存放原始指针(Header)
     size_t request_size = GetAlignedRequestSize(size, alignment);
 
     // 调用底层分配
@@ -234,16 +242,18 @@ inline void* malloc_aligned(size_t size, size_t alignment) noexcept {
     // 先留出 Header 的空间，然后向上对齐
     uintptr_t aligned_addr = (raw_addr + sizeof(void*) + (alignment - 1)) & ~(alignment - 1);
 
-    // 记录原始指针 (Header)
+    // 记录原始指针
     // 在对齐地址的前一个指针位置存放 raw_ptr
     (reinterpret_cast<void**>(aligned_addr))[-1] = raw_ptr;
-
+    
+    
     return reinterpret_cast<void*>(aligned_addr);
 }
 
 inline void free_aligned(void* ptr) noexcept {
     if (ptr == nullptr) [[unlikely]] return;
 
+     
     // 取出 Header 中的原始指针
     void* raw_ptr = (reinterpret_cast<void**>(ptr))[-1];
 
@@ -252,33 +262,30 @@ inline void free_aligned(void* ptr) noexcept {
     KzAlloc::free(raw_ptr);
 }
 
-// ==========================================================
-// 优化版 Aligned Free (Sized Deallocation)
+
+// 优化版 Aligned Free
 // 场景：用户明确知道对象的原始大小和对齐参数
-// 优势：完全跳过 PageMap 查找，性能极高
-// ==========================================================
+// 优势：完全跳过 PageMap 查找，性能高
 inline void free_aligned(void* ptr, size_t size, size_t alignment) noexcept {
     if (ptr == nullptr) [[unlikely]] return;
 
-    // 必须重新计算当初 malloc 时请求的总大小
-    // 公式必须与 malloc_aligned 保持严格一致
+    
+    // 重新计算当初 malloc 时请求的总大小
     // 这里的 alignment 必须是当初 malloc 传入的同一个值
     size_t request_size = GetAlignedRequestSize(size, alignment);
 
-    // 获取原始指针 (Header)
+    // 获取原始指针
     void* raw_ptr = (reinterpret_cast<void**>(ptr))[-1];
 
-    // 调用底层的 Sized Free
-    // 这会直接计算 SizeClass 并归还给 ThreadCache，不查 PageMap
+    // 调用 Sized Free
     KzAlloc::free(raw_ptr, request_size);
 }
 
-// ==========================================================
-// 智能版 Aligned Realloc (支持原地复用)
+
+// 智能版 Aligned Realloc
 // 场景：不知道旧大小时使用
-// ==========================================================
 inline void* realloc_aligned(void* ptr, size_t new_size, size_t alignment) noexcept {
-    // 1. 特殊情况处理
+    // 特殊情况处理
     if (ptr == nullptr) [[unlikely]] return KzAlloc::malloc_aligned(new_size, alignment);
     if (new_size == 0) [[unlikely]] {
         KzAlloc::free_aligned(ptr);
@@ -290,7 +297,7 @@ inline void* realloc_aligned(void* ptr, size_t new_size, size_t alignment) noexc
     void* raw_ptr = (reinterpret_cast<void**>(ptr))[-1];
     
     // 查 PageMap 获取该块的物理总容量 (Span 的 objSize)
-    // 注意：这是底层分配的对齐后的大小 (例如 32, 64...)
+    // 注意这是底层分配的对齐后的大小
     size_t total_block_size = GetAllocatedSize(raw_ptr);
 
     // 计算当前指针对齐后的偏移量
@@ -299,24 +306,20 @@ inline void* realloc_aligned(void* ptr, size_t new_size, size_t alignment) noexc
     // 计算当前位置实际可用的剩余容量
     size_t available_capacity = total_block_size - offset;
 
-    // 尝试原地复用 (In-Place Reuse)
-    // 情况 A: 缩容 (Shrink) -> 总是复用
-    // 情况 B: 扩容 (Grow) 但仍在物理块范围内 -> 复用
+    // 尝试原地复用
+    // 缩容 -> 复用
+    // 扩容但仍在物理块范围内 -> 复用
     if (new_size <= available_capacity) {
         // 不需要做任何事，直接返回原指针
-        // 内存池不管理逻辑大小，只管理物理块，所以这里不需要通知内存池
         return ptr;
     }
 
-    // 无法复用，必须搬迁 (Fallback)
+    // 无法复用，必须搬迁
     void* new_ptr = KzAlloc::malloc_aligned(new_size, alignment);
     if (new_ptr != nullptr) {
-        // 拷贝数据
         // 有效数据长度是：旧的可用容量 vs 新大小 的较小值
-        // 注意：这里我们假设旧的有效数据填满了 available_capacity (或者更少)
-        // 为了安全，我们只能拷贝 available_capacity 长度，
-        // 但实际上用户可能只用了更少。由于不知道 old_size，只能按最大可能拷贝。
-        // *性能注记*：如果用户存的数据很少，这里可能会多拷贝一些垃圾数据，但这是安全的。
+        // 由于不知道 old_size，只能按最大可能拷贝
+        // 如果用户存的数据很少，这里可能会多拷贝一些垃圾数据，但这是安全的。
         size_t copy_len = (available_capacity < new_size) ? available_capacity : new_size;
         std::memcpy(new_ptr, ptr, copy_len);
         
@@ -327,10 +330,9 @@ inline void* realloc_aligned(void* ptr, size_t new_size, size_t alignment) noexc
     return new_ptr;
 }
 
-// ==========================================================
+
 // 极速版 Aligned Realloc
 // 场景：已知旧大小，追求极致性能
-// ==========================================================
 inline void* realloc_aligned(void* ptr, size_t old_size, size_t new_size, size_t alignment) noexcept {
     if (ptr == nullptr) [[unlikely]] return KzAlloc::malloc_aligned(new_size, alignment);
     if (new_size == 0) [[unlikely]] {
@@ -338,20 +340,17 @@ inline void* realloc_aligned(void* ptr, size_t old_size, size_t new_size, size_t
         return nullptr;
     }
 
-    // 计算底层 Size Class 需求
-    // 我们不关心具体的 offset，我们只关心：
-    // "为了满足 old_size + alignment，底层分配了多大的块？"
-    // "为了满足 new_size + alignment，底层需要分配多大的块？"
+    // 计算底层 Size Class 需求,得知之前分配多大（old_size + alignment）和现在需要多大（new_size + alignment）
     size_t old_req = GetAlignedRequestSize(old_size, alignment);
     size_t new_req = GetAlignedRequestSize(new_size, alignment);
 
-    // 获取对齐后的 Size Class 大小 (例如 17->32, 24->32)
+    // 获取对齐后的 Size Class 大小
     size_t old_class_size = SizeUtils::RoundUp(old_req);
     size_t new_class_size = SizeUtils::RoundUp(new_req);
 
     // 尝试原地复用
-    // 如果新的 Size Class 不大于旧的 Size Class，说明物理空间绝对够用！
-    // 即使 new_size > old_size，只要它们落在同一个 Size Class 区间内，就可以复用。
+    // 如果新的 Size Class 不大于旧的 Size Class，说明物理空间绝对够用
+    // 即使 new_size > old_size，只要它们落在同一个 Size Class 区间内，就可以复用
     if (new_class_size <= old_class_size) {
         return ptr;
     }
@@ -359,15 +358,19 @@ inline void* realloc_aligned(void* ptr, size_t old_size, size_t new_size, size_t
     // 异地搬迁
     void* new_ptr = KzAlloc::malloc_aligned(new_size, alignment);
     if (new_ptr != nullptr) {
-        // 精确拷贝：因为知道 old_size，所以只拷贝有效数据
+        // 因为知道 old_size，所以只拷贝有效数据
         size_t copy_len = (old_size < new_size) ? old_size : new_size;
         std::memcpy(new_ptr, ptr, copy_len);
         
-        // 释放旧块 (使用 Sized Free 优化)
+        // 释放旧块
         KzAlloc::free_aligned(ptr, old_size, alignment);
     }
 
     return new_ptr;
+}
+
+inline size_t RoundUp(size_t size) noexcept {
+    return SizeUtils::RoundUp(size);
 }
 
 } // namespace KzAlloc

@@ -27,7 +27,7 @@ public:
         // 析构时单线程执行，无需加锁
         void* cur = _currentBlock;
         while (cur) {
-            void* next = NextObj(cur);
+            void* next = GetNextObj(cur);
             SystemFree(cur, _blockSize >> PAGE_SHIFT);
             cur = next;
         }
@@ -63,7 +63,7 @@ public:
             // 读取下一个节点
             // 使用 C++20 std::atomic_ref 进行 Relaxed 读
             // 告诉编译器：这是一个可能被其他线程并发修改的值，不要做任何假设和优化！
-            void* next = std::atomic_ref<void*>(NextObj(head.ptr)).load(std::memory_order_relaxed);
+            void* next = std::atomic_ref<void*>(*reinterpret_cast<void**>(head.ptr)).load(std::memory_order_relaxed);
 
             // 尝试 CAS 更新头节点，tag + 1 防止 ABA
             TaggedPointer new_head{next, head.tag + 1};
@@ -87,7 +87,7 @@ public:
         while (true) {
             // 头插法：将当前对象的 next 指向当前的 head.ptr
             // 在插入前 obj 还是线程独占的，不需要原子写入
-            NextObj(obj) = head.ptr;
+            SetNextObj(obj, head.ptr);
             new_head.tag = head.tag + 1;
 
             // 尝试 CAS
@@ -110,7 +110,7 @@ private:
         // 无锁挂载到 _currentBlock (用于析构时释放)
         void* old_block = _currentBlock.load(std::memory_order_relaxed);
         do {
-            NextObj(newBlock) = old_block;
+            SetNextObj(newBlock, old_block);
         } while (!_currentBlock.compare_exchange_weak(old_block, newBlock, 
                                                   std::memory_order_release, 
                                                   std::memory_order_relaxed));
@@ -138,9 +138,9 @@ private:
             if (local_head == nullptr) {
                 local_head = obj;
                 local_tail = obj;
-                NextObj(obj) = nullptr;
+                SetNextObj(obj, nullptr);
             } else {
-                NextObj(obj) = local_head;
+                SetNextObj(obj, local_head);
                 local_head = obj;
             }
         }
@@ -153,7 +153,7 @@ private:
 
             do {
                 // 将本地链表的尾部指向当前的全局头部
-                NextObj(local_tail) = global_head.ptr;
+                SetNextObj(local_tail, global_head.ptr);
                 new_global_head.tag = global_head.tag + 1;
             } while (!_head.compare_exchange_weak(global_head, new_global_head, 
                                                   std::memory_order_release, 

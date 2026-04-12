@@ -3,10 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cassert>
-#include <mutex>
-#include <cassert>
 #include <new>
 #include <cstdio>
+#include <cstring>
+#include <errno.h>
+#include <cstdlib>
 #include "SizeUtils.h"
 
 // 平台宏判断
@@ -30,8 +31,14 @@ namespace KzAlloc {
 #endif
 
 // 辅助函数
-inline void*& NextObj(void* obj) noexcept {
-    return *reinterpret_cast<void**>(obj);
+inline void* GetNextObj(void* obj) noexcept {
+    void* next;
+    std::memcpy(&next, obj, sizeof(void*));
+    return next;
+}
+
+inline void SetNextObj(void* obj, void* next) noexcept {
+    std::memcpy(obj, &next, sizeof(void*));
 }
 
 inline void handleOOM() noexcept {
@@ -80,28 +87,33 @@ inline constexpr size_t HUGE_PAGE_MASK = ~(HUGE_PAGE_SIZE - 1);
     // Windows 的 VirtualAlloc 默认分配粒度是 64KB
     return VirtualAlloc(0, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-    // Hot Path: 纯大页分配 (2MB 的整数倍)
-    if ((size & ~HUGE_PAGE_MASK) == 0) [[likely]] {
-        void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+     // 尝试直接申请大页 (不使用占位和 MAP_FIXED)
+    // 如果 size 是 2MB 的整数倍
+    /*
+    if (size % HUGE_PAGE_SIZE == 0) {
+        void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, 
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
-        
-        // OS 保证大页 2MB 对齐
         if (ptr != MAP_FAILED) [[likely]] {
             return ptr;
         }
-        // 如果大页失败 (系统未开启或碎片过多)，则 Fallback 到下面的通用逻辑
+        // 如果大页失败，直接 Fallback 到下面的普通分配，不需要复杂的覆盖
     }
-
-    // Cold Path: 大页 + 小页混合分配 或 纯小页分配
-    // 虚拟地址占位
-    size_t reserve_size = size + HUGE_PAGE_SIZE;
-    void* reserve_ptr = mmap(nullptr, reserve_size, PROT_NONE, 
+    */
+    // 2. 普通分配 (大页失败，或者 size 不是 2MB 整数倍)
+    // 这里我们放弃了强求 2MB 物理对齐，因为在没有大页的情况下，
+    // 强求 2MB 虚拟地址对齐对性能的提升微乎其微，反而增加了系统调用的开销。
+    // 我们只需要保证它满足 PAGE_SIZE (16KB) 对齐即可。
+    
+    // mmap 默认保证 4KB 对齐。为了保证 16KB 对齐，我们需要多申请 16KB。
+    size_t reserve_size = size + PAGE_SIZE;
+    void* reserve_ptr = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE, 
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                             
     if (reserve_ptr == MAP_FAILED) [[unlikely]] return nullptr;
 
-    // 计算 2MB 对齐的起始地址
+    // 计算 16KB 对齐的起始地址
     uintptr_t raw_addr = reinterpret_cast<uintptr_t>(reserve_ptr);
-    uintptr_t aligned_addr = (raw_addr + HUGE_PAGE_SIZE - 1) & HUGE_PAGE_MASK;
+    uintptr_t aligned_addr = (raw_addr + PAGE_ROUND_UP_NUM) & PAGE_ROUND_UP_NUM_NEGATE;
 
     // 切除头尾多余的虚拟地址
     size_t prefix_len = aligned_addr - raw_addr;
@@ -110,27 +122,7 @@ inline constexpr size_t HUGE_PAGE_MASK = ~(HUGE_PAGE_SIZE - 1);
     size_t suffix_len = reserve_size - size - prefix_len;
     if (suffix_len > 0) munmap(reinterpret_cast<void*>(aligned_addr + size), suffix_len);
 
-    void* final_ptr = reinterpret_cast<void*>(aligned_addr);
-
-    // 大页 + 小页混合物理映射 (MAP_FIXED 覆盖)
-    size_t huge_part = size & HUGE_PAGE_MASK;
-    size_t small_part = size - huge_part;
-
-    if (huge_part > 0) [[likely]] {
-        void* huge_ptr = mmap(final_ptr, huge_part, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE | MAP_FIXED, -1, 0);
-        if (huge_ptr == MAP_FAILED) [[unlikely]] {
-            // Fallback: 如果大页失败，用普通页覆盖
-            mmap(final_ptr, huge_part, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        }
-    }
-    assert(small_part > 0);
-    void* small_ptr_start = reinterpret_cast<void*>(aligned_addr + huge_part);
-    mmap(small_ptr_start, small_part, PROT_READ | PROT_WRITE,
-         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    
-    return final_ptr;
+    return reinterpret_cast<void*>(aligned_addr);
 #endif
 }
 
